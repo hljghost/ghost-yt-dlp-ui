@@ -42,7 +42,10 @@
 
             <label>
               下载目录
-              <input id="output_dir" name="output_dir" type="text" value="{{ default_output_dir }}" />
+              <div class="input-with-action">
+                <input id="output_dir" name="output_dir" type="text" value="{{ default_output_dir }}" />
+                <button id="pick-output-dir-btn" type="button" class="btn-secondary">选择目录</button>
+              </div>
             </label>
 
             <div class="inline-fields">
@@ -188,6 +191,8 @@
             <div><span>代理</span><strong id="job-proxy">-</strong></div>
             <div><span>消息</span><strong id="job-message">等待开始</strong></div>
             <div><span>输出文件</span><strong id="job-output">-</strong></div>
+            <div><span>失败类型</span><strong id="job-failure-type">-</strong></div>
+            <div class="full"><span>失败建议</span><strong id="job-failure-hint">-</strong></div>
           </div>
 
           <div class="progress-wrap">
@@ -209,6 +214,7 @@
       const requeueBtn = document.getElementById("requeue-btn");
       const openDirBtn = document.getElementById("open-dir-btn");
       const parseBtn = document.getElementById("parse-btn");
+      const pickOutputDirBtn = document.getElementById("pick-output-dir-btn");
       const parseStatusEl = document.getElementById("parse-status");
       const mediaInfoEl = document.getElementById("media-info");
 
@@ -219,6 +225,8 @@
       const proxyEl = document.getElementById("job-proxy");
       const messageEl = document.getElementById("job-message");
       const outputEl = document.getElementById("job-output");
+      const failureTypeEl = document.getElementById("job-failure-type");
+      const failureHintEl = document.getElementById("job-failure-hint");
       const progressBar = document.getElementById("progress-bar");
       const logsEl = document.getElementById("logs");
       const jobListEl = document.getElementById("job-list");
@@ -246,6 +254,13 @@
       const notifiedDoneJobs = new Set();
       const ACTIVE_STATUSES = new Set(["queued", "running", "canceling", "retrying"]);
       const REQUEUE_ALLOWED = new Set(["failed", "canceled", "done"]);
+      const FAILURE_TYPE_LABELS = {
+        network: "网络问题",
+        permission: "权限/访问限制",
+        format: "格式不可用",
+        dependency: "依赖缺失",
+        unknown: "未知错误",
+      };
 
       function setProgress(value) {
         const progress = Math.max(0, Math.min(100, Number(value) || 0));
@@ -443,6 +458,9 @@
         proxyEl.textContent = renderProxyInfo(job);
         messageEl.textContent = job.message || "-";
         outputEl.textContent = job.output_file || "-";
+        const failureType = String(job.failure_type || "").trim();
+        failureTypeEl.textContent = failureType ? FAILURE_TYPE_LABELS[failureType] || failureType : "-";
+        failureHintEl.textContent = String(job.failure_hint || "").trim() || "-";
         setProgress(job.progress);
 
         const logs = Array.isArray(job.logs) ? job.logs : [];
@@ -531,7 +549,11 @@
           const proxyTag = proxyPool.length
             ? `p:${((Number(job.proxy_index) || 0) % proxyPool.length) + 1}/${proxyPool.length}`
             : "p:-";
-          row.textContent = `${job.status.padEnd(9, " ")} | ${retryTag} | ${proxyTag} | retry ${job.retry_count || 0}/${job.retry_max || 0} | ${job.id} | ${job.url}`;
+          const failureTag =
+            job.status === "failed" && String(job.failure_type || "").trim()
+              ? ` | fail:${job.failure_type}`
+              : "";
+          row.textContent = `${job.status.padEnd(9, " ")} | ${retryTag} | ${proxyTag} | retry ${job.retry_count || 0}/${job.retry_max || 0}${failureTag} | ${job.id} | ${job.url}`;
           row.title = job.url;
           row.addEventListener("click", () => {
             currentJobId = job.id;
@@ -636,6 +658,44 @@
         parseStatusEl.textContent = "解析完成";
         renderMediaInfo(data);
         populateFormats(data.formats);
+      });
+
+      pickOutputDirBtn.addEventListener("click", async () => {
+        const previousLabel = pickOutputDirBtn.textContent;
+        pickOutputDirBtn.disabled = true;
+        pickOutputDirBtn.textContent = "选择中...";
+
+        let data = {};
+        let resp;
+        try {
+          resp = await fetch("/api/select-output-dir", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ initial_dir: outputDirEl.value.trim() }),
+          });
+          data = await resp.json();
+        } catch {
+          pickOutputDirBtn.disabled = false;
+          pickOutputDirBtn.textContent = previousLabel;
+          messageEl.textContent = "目录选择失败：无法连接后端";
+          return;
+        }
+
+        pickOutputDirBtn.disabled = false;
+        pickOutputDirBtn.textContent = previousLabel;
+
+        if (!resp.ok) {
+          messageEl.textContent = data.error || "目录选择失败";
+          return;
+        }
+        if (data.canceled) {
+          messageEl.textContent = "已取消目录选择";
+          return;
+        }
+        if (data.path) {
+          outputDirEl.value = String(data.path);
+          messageEl.textContent = `已选择目录: ${data.path}`;
+        }
       });
 
       form.addEventListener("submit", async (event) => {

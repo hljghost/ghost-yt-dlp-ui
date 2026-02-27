@@ -143,6 +143,23 @@ button:disabled {
   gap: 12px;
 }
 
+.input-with-action {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.input-with-action input {
+  margin-top: 6px;
+}
+
+.input-with-action button {
+  width: auto;
+  margin-top: 6px;
+  white-space: nowrap;
+}
+
 .inline-fields-3 {
   display: grid;
   grid-template-columns: 1fr 1fr 1fr;
@@ -211,6 +228,14 @@ button:disabled {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.status-grid .full {
+  grid-column: 1 / -1;
+}
+
+.status-grid .full strong {
+  white-space: normal;
 }
 
 .progress-wrap {
@@ -289,7 +314,12 @@ button:disabled {
   .inline-fields,
   .inline-fields-3,
   .status-grid,
-  .row-actions {
+  .row-actions,
+  .input-with-action {
     grid-template-columns: 1fr;
+  }
+
+  .input-with-action button {
+    width: 100%;
   }
 }

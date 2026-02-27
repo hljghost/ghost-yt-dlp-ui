@@ -37,6 +37,60 @@ MAX_RETRY_MAX_DELAY_SECONDS = 600
 DEFAULT_AUTO_OPEN_OUTPUT = False
 MAX_PROXY_POOL_SIZE = 20
 RETRY_STRATEGIES = {"fixed", "exponential"}
+FAILURE_TYPE_LABELS = {
+    "network": "网络问题",
+    "permission": "权限/访问限制",
+    "format": "格式不可用",
+    "dependency": "依赖缺失",
+    "unknown": "未知错误",
+}
+FORMAT_FAILURE_KEYWORDS = (
+    "requested format is not available",
+    "format not available",
+    "no video formats found",
+    "no suitable formats",
+    "invalid format",
+)
+PERMISSION_FAILURE_KEYWORDS = (
+    "http error 401",
+    "http error 403",
+    "forbidden",
+    "unauthorized",
+    "permission denied",
+    "sign in to confirm your age",
+    "private video",
+    "members-only",
+    "login required",
+    "not available in your region",
+)
+FILESYSTEM_FAILURE_KEYWORDS = (
+    "permission denied",
+    "read-only file system",
+    "operation not permitted",
+    "no space left on device",
+    "file name too long",
+)
+NETWORK_FAILURE_KEYWORDS = (
+    "timed out",
+    "timeout",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "network is unreachable",
+    "connection refused",
+    "connection reset",
+    "remote end closed connection",
+    "failed to establish a new connection",
+    "proxy error",
+    "proxyconnect",
+    "cannot connect to proxy",
+    "i/o timeout",
+    "http error 429",
+)
+DEPENDENCY_FAILURE_KEYWORDS = (
+    "ffmpeg not found",
+    "ffprobe and ffmpeg not found",
+    "no such file or directory: 'ffmpeg'",
+)
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
@@ -60,6 +114,8 @@ class DownloadJob:
     proxy_pool: list[str] = field(default_factory=list)
     proxy_index: int = 0
     active_proxy: str | None = None
+    failure_type: str = ""
+    failure_hint: str = ""
     status: str = "queued"
     progress: float = 0.0
     message: str = "等待开始"
@@ -196,6 +252,57 @@ def strip_proxy_flags(tokens: list[str]) -> list[str]:
             continue
         cleaned.append(token)
     return cleaned
+
+
+def has_any_keyword(text: str, keywords: tuple[str, ...]) -> bool:
+    return any(keyword in text for keyword in keywords)
+
+
+def infer_failure_type(log_text: str) -> str:
+    text = log_text.lower()
+    if has_any_keyword(text, FORMAT_FAILURE_KEYWORDS):
+        return "format"
+    if has_any_keyword(text, DEPENDENCY_FAILURE_KEYWORDS):
+        return "dependency"
+    if has_any_keyword(text, FILESYSTEM_FAILURE_KEYWORDS):
+        return "permission"
+    if has_any_keyword(text, PERMISSION_FAILURE_KEYWORDS):
+        return "permission"
+    if has_any_keyword(text, NETWORK_FAILURE_KEYWORDS):
+        return "network"
+    return "unknown"
+
+
+def failure_hint_for(failure_type: str, has_proxy_pool: bool) -> str:
+    if failure_type == "format":
+        return "建议先点“解析视频信息”重选格式，或清空“自定义格式”后使用默认推荐格式。"
+    if failure_type == "permission":
+        return "可能是权限或登录限制。请检查下载目录写权限，并在“额外参数”里加 cookies（如 --cookies cookies.txt）。"
+    if failure_type == "network":
+        if has_proxy_pool:
+            return "网络或代理连接异常。请检查代理池可用性，必要时先清空代理池后重试。"
+        return "网络连接不稳定。请检查网络/DNS 后重试，或稍后再试。"
+    if failure_type == "dependency":
+        return "缺少依赖组件。请先安装 ffmpeg 并确保命令可用，再重试。"
+    return "请查看日志中的 ERROR 行定位问题，可先移除额外参数后重试。"
+
+
+def classify_failure(job_snapshot: dict[str, Any], exit_code: int) -> tuple[str, str, str]:
+    logs = job_snapshot.get("logs", [])
+    tail_logs: list[str] = []
+    if isinstance(logs, list):
+        tail_logs = [str(line) for line in logs[-160:]]
+
+    message = str(job_snapshot.get("message") or "")
+    text = "\n".join([*tail_logs, message, f"exit code {exit_code}"]).lower()
+    failure_type = infer_failure_type(text)
+    if failure_type == "unknown" and str(job_snapshot.get("format_id") or "").strip():
+        # When custom format is set, unknown yt-dlp failures are usually format-related.
+        failure_type = "format"
+
+    label = FAILURE_TYPE_LABELS.get(failure_type, FAILURE_TYPE_LABELS["unknown"])
+    hint = failure_hint_for(failure_type, has_proxy_pool=bool(job_snapshot.get("proxy_pool")))
+    return failure_type, label, hint
 
 
 JOBS: dict[str, DownloadJob] = {}
@@ -403,6 +510,140 @@ def open_output_path(output_dir_text: str, output_file: str | None) -> str:
     return str(target)
 
 
+def resolve_initial_dir(initial_dir: str | None) -> Path:
+    base = Path(DEFAULT_OUTPUT_DIR).expanduser()
+    text = str(initial_dir or "").strip()
+    candidate = Path(text).expanduser() if text else base
+
+    if candidate.is_file():
+        candidate = candidate.parent
+
+    if candidate.exists():
+        return candidate.resolve()
+
+    parent = candidate.parent
+    if parent.exists():
+        return parent.resolve()
+
+    return Path.home().resolve()
+
+
+def choose_directory_macos(initial_dir: Path) -> str | None:
+    osascript = shutil.which("osascript")
+    if not osascript:
+        raise RuntimeError("未找到 osascript 命令")
+
+    escaped_path = str(initial_dir).replace("\\", "\\\\").replace('"', '\\"')
+    script_lines = [
+        f'set defaultPath to POSIX file "{escaped_path}"',
+        "try",
+        'set pickedFolder to choose folder with prompt "选择下载目录" default location defaultPath',
+        "return POSIX path of pickedFolder",
+        "on error number -128",
+        'return ""',
+        "end try",
+    ]
+    command = [osascript]
+    for line in script_lines:
+        command.extend(["-e", line])
+
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "目录选择失败")
+    picked = completed.stdout.strip()
+    return picked or None
+
+
+def choose_directory_windows(initial_dir: Path) -> str | None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        raise RuntimeError("未找到 PowerShell 命令")
+
+    escaped_path = str(initial_dir).replace("'", "''")
+    script = (
+        "Add-Type -AssemblyName System.Windows.Forms\n"
+        "$dialog = New-Object System.Windows.Forms.FolderBrowserDialog\n"
+        "$dialog.Description = '选择下载目录'\n"
+        "$dialog.UseDescriptionForTitle = $true\n"
+        f"$dialog.SelectedPath = '{escaped_path}'\n"
+        "if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {\n"
+        "  Write-Output $dialog.SelectedPath\n"
+        "}\n"
+    )
+
+    completed = subprocess.run(
+        [powershell, "-NoProfile", "-STA", "-Command", script],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "目录选择失败")
+    picked = completed.stdout.strip()
+    return picked or None
+
+
+def choose_directory_linux(initial_dir: Path) -> str | None:
+    zenity = shutil.which("zenity")
+    if zenity:
+        filename = str(initial_dir)
+        if not filename.endswith("/"):
+            filename = filename + "/"
+        completed = subprocess.run(
+            [zenity, "--file-selection", "--directory", "--title=选择下载目录", f"--filename={filename}"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        if completed.returncode in {0}:
+            picked = completed.stdout.strip()
+            return picked or None
+        if completed.returncode in {1}:
+            return None
+        raise RuntimeError(completed.stderr.strip() or "目录选择失败")
+
+    kdialog = shutil.which("kdialog")
+    if kdialog:
+        completed = subprocess.run(
+            [kdialog, "--getexistingdirectory", str(initial_dir)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
+        if completed.returncode in {0}:
+            picked = completed.stdout.strip()
+            return picked or None
+        if completed.returncode in {1}:
+            return None
+        raise RuntimeError(completed.stderr.strip() or "目录选择失败")
+
+    raise RuntimeError("当前系统未找到目录选择器（需要 zenity 或 kdialog），请手动输入路径")
+
+
+def select_output_directory(initial_dir: str | None) -> str | None:
+    start_dir = resolve_initial_dir(initial_dir)
+    picked: str | None
+
+    if sys.platform == "darwin":
+        picked = choose_directory_macos(start_dir)
+    elif os.name == "nt":
+        picked = choose_directory_windows(start_dir)
+    else:
+        picked = choose_directory_linux(start_dir)
+
+    if not picked:
+        return None
+    try:
+        return str(Path(picked).expanduser().resolve())
+    except Exception:
+        return picked
+
+
 def download_worker() -> None:
     while True:
         job_id = JOB_QUEUE.get()
@@ -507,7 +748,21 @@ def run_download(job_id: str) -> None:
     try:
         command = build_command(job)
     except Exception as exc:
-        update_job(job_id, status="failed", message=str(exc), progress=0.0)
+        message = str(exc)
+        failure_type = "dependency" if "yt-dlp" in message.lower() else "unknown"
+        failure_hint = (
+            "请先安装 yt-dlp（python3 -m pip install -U yt-dlp）"
+            if failure_type == "dependency"
+            else failure_hint_for("unknown", has_proxy_pool=bool(job.proxy_pool))
+        )
+        update_job(
+            job_id,
+            status="failed",
+            message=message,
+            progress=0.0,
+            failure_type=failure_type,
+            failure_hint=failure_hint,
+        )
         return
 
     attempt = job.retry_count + 1
@@ -519,6 +774,8 @@ def run_download(job_id: str) -> None:
         message=f"开始下载 (尝试 {attempt}/{total_attempts}){proxy_text}",
         progress=0.0,
         active_proxy=proxy,
+        failure_type="",
+        failure_hint="",
     )
     if proxy:
         append_log(job_id, f"[proxy] use {proxy_index + 1}/{proxy_total}: {proxy}")
@@ -556,7 +813,7 @@ def run_download(job_id: str) -> None:
         if is_cancel_requested(job_id):
             update_job(job_id, status="canceled", message="任务已取消")
         elif code == 0:
-            update_job(job_id, status="done", progress=100.0, message="下载完成")
+            update_job(job_id, status="done", progress=100.0, message="下载完成", failure_type="", failure_hint="")
             if job.auto_open_output:
                 with JOBS_LOCK:
                     latest = JOBS.get(job_id)
@@ -569,10 +826,22 @@ def run_download(job_id: str) -> None:
                 except Exception as exc:
                     append_log(job_id, f"[open-output] 自动打开目录失败: {exc}")
                     update_job(job_id, message="下载完成（自动打开目录失败）")
-        elif schedule_retry(job_id, f"下载失败，退出码 {code}"):
-            pass
         else:
-            update_job(job_id, status="failed", message=f"下载失败，退出码 {code}")
+            latest = snapshot_job(job_id) or job_data
+            failure_type, failure_label, failure_hint = classify_failure(latest, code)
+            failure_reason = f"下载失败（{failure_label}，退出码 {code}）"
+            append_log(job_id, f"[failure] 类型: {failure_label} | 建议: {failure_hint}")
+
+            if schedule_retry(job_id, failure_reason):
+                update_job(job_id, failure_type=failure_type, failure_hint=failure_hint)
+            else:
+                update_job(
+                    job_id,
+                    status="failed",
+                    message=f"{failure_reason}。建议：{failure_hint}",
+                    failure_type=failure_type,
+                    failure_hint=failure_hint,
+                )
     finally:
         remove_process(job_id)
 
@@ -840,6 +1109,21 @@ def create_download() -> Any:
     if len(created_ids) == 1:
         response["job_id"] = created_ids[0]
     return jsonify(response)
+
+
+@app.post("/api/select-output-dir")
+def select_output_dir() -> Any:
+    payload = request.get_json(silent=True) or {}
+    initial_dir = str(payload.get("initial_dir", "")).strip() or None
+
+    try:
+        picked = select_output_directory(initial_dir)
+    except Exception as exc:
+        return jsonify({"error": f"选择目录失败：{exc}"}), 500
+
+    if not picked:
+        return jsonify({"ok": True, "canceled": True})
+    return jsonify({"ok": True, "canceled": False, "path": picked})
 
 
 @app.get("/api/jobs")

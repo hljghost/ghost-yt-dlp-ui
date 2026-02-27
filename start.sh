@@ -33,7 +33,63 @@ PYTHON_BIN="$VENV_DIR/bin/python"
 PIP_BIN="$VENV_DIR/bin/pip"
 REQ_FILE="$ROOT_DIR/requirements.txt"
 REQ_HASH_FILE="$VENV_DIR/.requirements.sha256"
-APP_URL="http://127.0.0.1:17800"
+APP_HOST="127.0.0.1"
+APP_PORT="17800"
+APP_URL="http://${APP_HOST}:${APP_PORT}"
+
+wait_for_server() {
+  local host="$1"
+  local port="$2"
+  local attempts="${3:-80}"
+  local interval="${4:-0.25}"
+
+  "$PYTHON_BIN" - "$host" "$port" "$attempts" "$interval" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+attempts = int(float(sys.argv[3]))
+interval = float(sys.argv[4])
+
+for _ in range(attempts):
+    sock = socket.socket()
+    sock.settimeout(interval)
+    try:
+        sock.connect((host, port))
+    except OSError:
+        time.sleep(interval)
+    else:
+        sock.close()
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+open_browser_url() {
+  local url="$1"
+
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v wslview >/dev/null 2>&1; then
+    wslview "$url" >/dev/null 2>&1 && return 0
+  fi
+
+  if command -v cmd.exe >/dev/null 2>&1; then
+    cmd.exe /C start "" "$url" >/dev/null 2>&1 && return 0
+  fi
+
+  "$PYTHON_BIN" -m webbrowser "$url" >/dev/null 2>&1 && return 0
+  return 1
+}
 
 echo "[yt-dlp-ui] 准备运行环境..."
 
@@ -66,10 +122,11 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
   exit 0
 fi
 
-if [ "$OPEN_BROWSER" -eq 1 ] && command -v xdg-open >/dev/null 2>&1; then
+if [ "$OPEN_BROWSER" -eq 1 ]; then
   (
-    sleep 1
-    xdg-open "$APP_URL" >/dev/null 2>&1 || true
+    if wait_for_server "$APP_HOST" "$APP_PORT"; then
+      open_browser_url "$APP_URL" || true
+    fi
   ) &
 fi
 
